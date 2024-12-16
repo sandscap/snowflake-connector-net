@@ -266,7 +266,7 @@ namespace Snowflake.Data.Core.Session
         {
             if (TimeoutHelper.IsInfinite(_poolConfig.WaitingForIdleSessionTimeout))
                 throw new Exception("WaitingForIdleSessionTimeout cannot be infinite");
-            s_logger.Info($"SessionPool::WaitForSession for {(long) _poolConfig.WaitingForIdleSessionTimeout.TotalMilliseconds} ms timeout" + PoolIdentification());
+            s_logger.Info($"SessionPool::WaitForSession for {(long)_poolConfig.WaitingForIdleSessionTimeout.TotalMilliseconds} ms timeout" + PoolIdentification());
             _sessionPoolEventHandler.OnWaitingForSessionStarted(this);
             var beforeWaitingTimeMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             long nowTimeMillis = beforeWaitingTimeMillis;
@@ -274,7 +274,7 @@ namespace Snowflake.Data.Core.Session
             {
                 var timeoutLeftMillis = TimeoutHelper.FiniteTimeoutLeftMillis(beforeWaitingTimeMillis, nowTimeMillis, _poolConfig.WaitingForIdleSessionTimeout);
                 _sessionPoolEventHandler.OnWaitingForSessionStarted(this, timeoutLeftMillis);
-                var successful = _waitingForIdleSessionQueue.Wait((int) timeoutLeftMillis, CancellationToken.None);
+                var successful = _waitingForIdleSessionQueue.Wait((int)timeoutLeftMillis, CancellationToken.None);
                 if (successful)
                 {
                     s_logger.Debug($"SessionPool::WaitForSession - woken with a session granted" + PoolIdentification());
@@ -377,52 +377,63 @@ namespace Snowflake.Data.Core.Session
             CancellationToken cancellationToken) =>
             NewSessionAsync(connectionString, password, _noPoolingSessionCreationTokenCounter.NewToken(), cancellationToken);
 
-        private Task<SFSession> NewSessionAsync(String connectionString, SecureString password, SessionCreationToken sessionCreationToken, CancellationToken cancellationToken)
+        private async Task<SFSession> NewSessionAsync(String connectionString, SecureString password, SessionCreationToken sessionCreationToken, CancellationToken cancellationToken)
         {
             s_logger.Debug("SessionPool::NewSessionAsync" + PoolIdentification());
             var session = s_sessionFactory.NewSession(connectionString, password);
-            return session
-                .OpenAsync(cancellationToken)
-                .ContinueWith(previousTask =>
+            bool isFaulted = false, isCanceled = false;
+            Exception faultException = null;
+
+            try
+            {
+                await session.OpenAsync(cancellationToken);
+                if (GetPooling() && !_underDestruction)
                 {
-                    if (previousTask.IsFaulted || previousTask.IsCanceled)
+                    lock (_sessionPoolLock)
                     {
                         _sessionCreationTokenCounter.RemoveToken(sessionCreationToken);
-                        if (GetPooling())
-                        {
-                            lock (_sessionPoolLock)
-                            {
-                                s_logger.Debug($"Failed to create a new session {GetCurrentState()}" + PoolIdentification());
-                            }
-                        }
+                        _busySessionsCounter.Increase();
+                        s_logger.Debug($"Pool state after creating a session {GetCurrentState()}" + PoolIdentification());
                     }
+                }
 
-                    if (previousTask.IsFaulted && previousTask.Exception != null)
-                        throw previousTask.Exception;
+                _sessionPoolEventHandler.OnNewSessionCreated(this);
+                _sessionPoolEventHandler.OnSessionProvided(this);
 
-                    if (previousTask.IsFaulted)
-                        throw new SnowflakeDbException(
-                            SnowflakeDbException.CONNECTION_FAILURE_SSTATE,
-                            SFError.INTERNAL_ERROR,
-                            "Failure while opening session async");
+              
+            }
+            catch (TaskCanceledException)
+            {
+                isCanceled = true;
+            }
+            catch (Exception ex)
+            {
+                faultException = ex;
+                isFaulted = true;
+            }
 
-                    if (!previousTask.IsCanceled)
+            if (isFaulted || isCanceled)
+            {
+                _sessionCreationTokenCounter.RemoveToken(sessionCreationToken);
+                if (GetPooling())
+                {
+                    lock (_sessionPoolLock)
                     {
-                        if (GetPooling() && !_underDestruction)
-                        {
-                            lock (_sessionPoolLock)
-                            {
-                                _sessionCreationTokenCounter.RemoveToken(sessionCreationToken);
-                                _busySessionsCounter.Increase();
-                                s_logger.Debug($"Pool state after creating a session {GetCurrentState()}" + PoolIdentification());
-                            }
-                        }
-
-                        _sessionPoolEventHandler.OnNewSessionCreated(this);
-                        _sessionPoolEventHandler.OnSessionProvided(this);
+                        s_logger.Debug($"Failed to create a new session {GetCurrentState()}" + PoolIdentification());
                     }
-                    return session;
-                }, TaskContinuationOptions.NotOnCanceled);
+                }
+            }
+
+            if (isFaulted && faultException != null)
+                throw faultException;
+
+            if (isFaulted)
+                throw new SnowflakeDbException(
+                    SnowflakeDbException.CONNECTION_FAILURE_SSTATE,
+                    SFError.INTERNAL_ERROR,
+                    "Failure while opening session async");
+
+            return session;
         }
 
         internal void ReleaseBusySession(SFSession session)

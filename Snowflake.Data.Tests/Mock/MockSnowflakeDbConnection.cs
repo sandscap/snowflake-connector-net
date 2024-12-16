@@ -47,36 +47,25 @@ namespace Snowflake.Data.Tests.Mock
             OnSessionEstablished();
         }
 
-        public override Task OpenAsync(CancellationToken cancellationToken)
+        public override async Task OpenAsync(CancellationToken cancellationToken)
         {
             registerConnectionCancellationCallback(cancellationToken);
 
             SetMockSession();
 
-            return SfSession.OpenAsync(cancellationToken).ContinueWith(
-                previousTask =>
-                {
-                    if (previousTask.IsFaulted)
-                    {
-                    // Exception from SfSession.OpenAsync
-                    Exception sfSessionEx = previousTask.Exception;
-                        _connectionState = ConnectionState.Closed;
-                        logger.Error("Unable to connect", sfSessionEx);
-                        throw //sfSessionEx.InnerException;
-                        new SnowflakeDbException(sfSessionEx, SFError.INTERNAL_ERROR, "Unable to connect");
-                    }
-                    if (previousTask.IsCanceled)
-                    {
-                        _connectionState = ConnectionState.Closed;
-                        logger.Debug("Connection canceled");
-                    }
-                    else
-                    {
-                        OnSessionEstablished();
-                    }
-                },
-                cancellationToken);
-
+            try {
+                await SfSession.OpenAsync(cancellationToken);
+                OnSessionEstablished();                
+            }
+            catch (TaskCanceledException) {
+                _connectionState = ConnectionState.Closed;
+                logger.Debug("Connection canceled");
+            }
+            catch (Exception ex) {                    
+                _connectionState = ConnectionState.Closed;
+                logger.Error("Unable to connect", ex);
+                throw new SnowflakeDbException(ex, SFError.INTERNAL_ERROR, "Unable to connect");
+            }
         }
         
         private void SetMockSession()
